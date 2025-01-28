@@ -6,7 +6,7 @@
 /*jshint proto:true*/
 
 import { ok as assert } from 'assert';
-import * as debugBuilder from 'debug';
+import debugBuilder from 'debug';
 import * as fs from 'fs';
 import * as _ from 'lodash';
 import * as path from 'path';
@@ -23,11 +23,8 @@ const debug = debugBuilder('node-soap');
 
 const XSI_URI = 'http://www.w3.org/2001/XMLSchema-instance';
 
-const trimLeft = /^[\s\xA0]+/;
-const trimRight = /[\s\xA0]+$/;
-
-function trim(text) {
-  return text.replace(trimLeft, '').replace(trimRight, '');
+export function trim(text) {
+  return text.trim();
 }
 
 function deepMerge<A, B>(destination: A, source: B): A & B {
@@ -356,7 +353,9 @@ export class WSDL {
       const name = splitQName(nsName).name;
 
       if (typeof cur.schema === 'string' && (cur.schema === 'string' || cur.schema.split(':')[1] === 'string')) {
-        if (typeof obj === 'object' && Object.keys(obj).length === 0) { obj = cur.object = ''; }
+        if (typeof obj === 'object' && Object.keys(obj).length === 0) {
+          obj = cur.object = (this.options.preserveWhitespace ? cur.text || '' : '');
+        }
       }
 
       if (cur.nil === true) {
@@ -423,13 +422,17 @@ export class WSDL {
     };
 
     p.ontext = (text) => {
+      const top = stack[stack.length - 1];
+
       const originalText = text;
       text = trim(text);
       if (!text.length) {
+        if (this.options.preserveWhitespace) {
+          top.text = (top.text || '') + originalText;
+        }
         return;
       }
 
-      const top = stack[stack.length - 1];
       const name = splitQName(top.schema).name;
       let value;
 
@@ -502,13 +505,19 @@ export class WSDL {
       if (root.Envelope) {
         const body = root.Envelope.Body;
         if (body && body.Fault) {
-          let code = body.Fault.faultcode && body.Fault.faultcode.$value;
-          let string = body.Fault.faultstring && body.Fault.faultstring.$value;
-          let detail = body.Fault.detail && body.Fault.detail.$value;
+          const fault = body.Fault;
+          let code = fault.faultcode && fault.faultcode.$value;
+          let string = fault.faultstring && fault.faultstring.$value;
+          let detail = fault.detail && fault.detail.$value;
 
-          code = code || body.Fault.faultcode;
-          string = string || body.Fault.faultstring;
-          detail = detail || body.Fault.detail;
+          code = code || fault.faultcode;
+          string = string || fault.faultstring;
+          detail = detail || fault.detail;
+          // SOAP 1.2
+          code = code || fault.Code && `${fault.Code.Value}: ${fault.Code.Subcode && fault.Code.Subcode.Value}`;
+          string = string || fault.Reason && fault.Reason.Text.$value;
+          string = string || fault.Reason && fault.Reason.Text;
+          detail = detail || fault.Detail;
 
           const error: any = new Error(code + ': ' + string + (detail ? ': ' + JSON.stringify(detail) : ''));
 
@@ -846,7 +855,7 @@ export class WSDL {
                 let resolvedChildSchemaObject;
                 if (childSchemaObject.$type) {
                   const typeQName = splitQName(childSchemaObject.$type);
-                  const typePrefix = typeQName.prefix;
+                  const typePrefix = childSchemaObject.$baseNameSpace || typeQName.prefix;
                   const typeURI = schema.xmlns[typePrefix] || this.definitions.xmlns[typePrefix];
                   childNsURI = typeURI;
                   if (typeURI !== 'http://www.w3.org/2001/XMLSchema' && typePrefix !== TNS_PREFIX) {
@@ -1099,7 +1108,6 @@ export class WSDL {
 
             if (found) {
               found.$baseNameSpace = childNameSpace;
-              found.$type = childNameSpace + ':' + childName;
               break;
             }
           }
@@ -1201,14 +1209,18 @@ export class WSDL {
       includePath = url.resolve(this.uri || '', include.location);
     }
 
-    if (this.options.wsdl_options !== undefined && typeof this.options.wsdl_options.overrideImportLocation === 'function') {
-      includePath = this.options.wsdl_options.overrideImportLocation(includePath);
-    }
-
     const options = Object.assign({}, this.options);
     // follow supplied ignoredNamespaces option
     options.ignoredNamespaces = this._originalIgnoredNamespaces || this.options.ignoredNamespaces;
     options.WSDL_CACHE = this.WSDL_CACHE;
+
+    if (this.options.wsdl_options !== undefined && typeof this.options.wsdl_options.overrideImportLocation === 'function') {
+      try {
+        includePath = this.options.wsdl_options.overrideImportLocation(includePath, this.uri, include.location, options);
+      } catch (e) {
+        return callback(e);
+      }
+    }
 
     open_wsdl_recursive(includePath, options, (err, wsdl) => {
       if (err) {
@@ -1272,6 +1284,8 @@ export class WSDL {
           types.addChild(schema);
           root.addChild(types);
           stack.push(schema);
+        } else if (name === 'html') {
+          throw new Error(`Root element of WSDL was <html>. This is likely an authentication issue.`);
         } else {
           throw new Error('Unexpected root element of WSDL or include');
         }

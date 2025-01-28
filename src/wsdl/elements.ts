@@ -1,6 +1,6 @@
 
 import { ok as assert } from 'assert';
-import * as debugBuilder from 'debug';
+import debugBuilder from 'debug';
 import * as _ from 'lodash';
 import { IWsdlBaseOptions } from '../types';
 import { splitQName, TNS_PREFIX } from '../utils';
@@ -65,6 +65,7 @@ export class Element {
   public $targetNamespace?;
   public children: Element[] = [];
   public ignoredNamespaces;
+  public strict: boolean;
   public name?: string;
   public nsName?;
   public prefix?: string;
@@ -124,7 +125,10 @@ export class Element {
       return;
     }
 
-    const ChildClass = this.allowedChildren[splitQName(nsName).name];
+    let ChildClass = this.allowedChildren[splitQName(nsName).name];
+    if (ChildClass == null && !this.strict) {
+      ChildClass = UnexpectedElement;
+    }
     if (ChildClass) {
       const child = new ChildClass(nsName, attrs, options, schemaXmlns);
       child.init();
@@ -171,11 +175,21 @@ export class Element {
       this.valueKey = options.valueKey || '$value';
       this.xmlKey = options.xmlKey || '$xml';
       this.ignoredNamespaces = options.ignoredNamespaces || [];
+      this.strict = options.strict || false;
     } else {
       this.valueKey = '$value';
       this.xmlKey = '$xml';
       this.ignoredNamespaces = [];
+      this.strict = false;
     }
+  }
+}
+
+export class UnexpectedElement extends Element {
+  public startElement(stack: Element[], nsName: string, attrs, options: IWsdlBaseOptions, schemaXmlns) {
+    const child = new UnexpectedElement(nsName, attrs, options, schemaXmlns);
+    child.init();
+    stack.push(child);
   }
 }
 
@@ -215,7 +229,7 @@ export class ElementElement extends Element {
 
     const isMany = maxOccurs > 1;
 
-    if (isMany) {
+    if (isMany && name) {
       name += '[]';
     }
 
@@ -227,6 +241,7 @@ export class ElementElement extends Element {
       type = splitQName(type);
       const typeName: string = type.name;
       const ns: string = xmlns && xmlns[type.prefix] ||
+        this.xmlns[type.prefix] ||
         ((definitions.xmlns[type.prefix] !== undefined || definitions.xmlns[this.targetNSAlias] !== undefined) && this.schemaXmlns[type.prefix]) ||
         definitions.xmlns[type.prefix];
       const schema = definitions.schemas[ns];
@@ -251,6 +266,11 @@ export class ElementElement extends Element {
             Object.keys(description).forEach((key) => {
               elem[key] = description[key];
             });
+
+            const $attributes = description[AttributeElement.Symbol];
+            if ($attributes) {
+              elem[AttributeElement.Symbol] = $attributes;
+            }
           }
 
           if (this.$ref) {
@@ -267,7 +287,14 @@ export class ElementElement extends Element {
           typeStorage[typeName] = elem;
         } else {
           if (this.$ref) {
-            element = typeStorage[typeName];
+            // Differentiate between a ref for an array of elements and a ref for a single element
+            if (isMany) {
+              const refTypeName = typeName + '[]';
+              typeStorage[refTypeName] = typeStorage[typeName];
+              element[refTypeName] = typeStorage[refTypeName];
+            } else {
+              element = typeStorage[typeName];
+            }
           } else {
             element[name] = typeStorage[typeName];
           }
@@ -363,18 +390,32 @@ export class RestrictionElement extends Element {
     'choice',
     'enumeration',
     'sequence',
+    'attribute',
   ]);
   public $base: string;
 
   public description(definitions?: DefinitionsElement, xmlns?: IXmlNs) {
     const children = this.children;
     let desc;
-    for (let i = 0, child; child = children[i]; i++) {
-      if (child instanceof SequenceElement || child instanceof ChoiceElement) {
+    let isFirstChild = false;
+    const $attributes = {};
+
+    for (const child of children) {
+      if (child instanceof AttributeElement) {
+        $attributes[child.$name] = child.description(definitions);
+        continue;
+      }
+      if (!isFirstChild && (child instanceof SequenceElement || child instanceof ChoiceElement)) {
+        isFirstChild = true;
         desc = child.description(definitions, xmlns);
-        break;
       }
     }
+
+    if (Object.keys($attributes).length > 0) {
+      desc = desc ?? {};
+      desc[AttributeElement.Symbol] = $attributes;
+    }
+
     if (desc && this.$base) {
       const type = splitQName(this.$base);
       const typeName = type.name;
@@ -385,11 +426,16 @@ export class RestrictionElement extends Element {
       desc.getBase = () => {
         return typeElement.description(definitions, schema.xmlns);
       };
+      if (typeElement) {
+        const baseDescription = typeElement.description(definitions, schema.xmlns);
+        if (baseDescription[AttributeElement.Symbol]) {
+          _.defaults($attributes, baseDescription[AttributeElement.Symbol]);
+        }
+        desc = _.defaults(desc, baseDescription);
+      }
       return desc;
     }
 
-    // then simple element
-    const base = this.$base ? this.$base + '|' : '';
     const restrictions = this.children.map((child) => {
       return child.description();
     }).join(',');
@@ -471,30 +517,46 @@ export class ComplexTypeElement extends Element {
     'complexContent',
     'sequence',
     'simpleContent',
+    'attribute',
   ]);
   public description(definitions: DefinitionsElement, xmlns: IXmlNs) {
+    let ret = {};
+    let isFirstChild = false;
+    const $attributes = {};
     const children = this.children || [];
     for (const child of children) {
-      if (child instanceof ChoiceElement ||
+      if (child instanceof AttributeElement) {
+        $attributes[child.$name] = child.description(definitions);
+        continue;
+      }
+
+      if (!isFirstChild && (child instanceof ChoiceElement ||
         child instanceof SequenceElement ||
         child instanceof AllElement ||
         child instanceof SimpleContentElement ||
-        child instanceof ComplexContentElement) {
-
-        return child.description(definitions, xmlns);
+        child instanceof ComplexContentElement)) {
+        isFirstChild = true;
+        ret = child.description(definitions, xmlns);
       }
     }
-    return {};
+
+    if (Object.keys($attributes).length > 0) {
+      ret[AttributeElement.Symbol] = $attributes;
+    }
+
+    return ret;
   }
 }
 
 export class ComplexContentElement extends Element {
   public readonly allowedChildren = buildAllowedChildren([
     'extension',
+    'restriction',
   ]);
+
   public description(definitions: DefinitionsElement, xmlns: IXmlNs) {
     for (const child of this.children) {
-      if (child instanceof ExtensionElement) {
+      if (child instanceof ExtensionElement || child instanceof RestrictionElement) {
         return child.description(definitions, xmlns);
       }
     }
@@ -535,6 +597,19 @@ export class SequenceElement extends Element {
       }
     }
     return sequence;
+  }
+}
+
+export class AttributeElement extends Element {
+  public static Symbol = Symbol('$attributes');
+  public $type?: string;
+  public $use?: string;
+
+  public description(definitions: DefinitionsElement) {
+    return {
+      type: this.$type,
+      required: this.$use === 'required',
+    };
   }
 }
 
@@ -872,14 +947,16 @@ export class OperationElement extends Element {
       }
       const messageName = splitQName(child.$message).name;
       const message = definitions.messages[messageName];
-      message.postProcess(definitions);
-      if (message.element) {
-        definitions.messages[message.element.$name] = message;
-        this[child.name] = message.element;
-      } else {
-        this[child.name] = message;
+      if (message) {
+        message.postProcess(definitions);
+        if (message.element) {
+          definitions.messages[message.element.$name] = message;
+          this[child.name] = message.element;
+        } else {
+          this[child.name] = message;
+        }
+        children.splice(i--, 1);
       }
-      children.splice(i--, 1);
     }
     this.deleteFixedAttrs();
   }
@@ -1170,6 +1247,7 @@ const ElementTypeMap: {
   simpleContent: SimpleContentElement,
   simpleType: SimpleTypeElement,
   types: TypesElement,
+  attribute: AttributeElement,
 };
 
 function buildAllowedChildren(elementList: string[]): { [k: string]: typeof Element } {
